@@ -38,7 +38,7 @@ TOPIC_EXECUTION  = "domotique/mistral/execution"   # TS → proxy (déclenchemen
 
 RULES_FILE       = os.environ.get("RULES_FILE", "/app/rules/regles_mistral.txt")
 LOG_DIR          = "/app/logs"
-MQTT_TIMEOUT_SEC = 15   # délai max d'attente réponse TS
+MQTT_TIMEOUT_SEC = 2   # délai max d'attente réponse TS
 
 # ─── Types JSON structurés à router vers MQTT ─────────────────────────────────
 
@@ -75,18 +75,36 @@ DEFAULT_MODEL = "mistral-small-latest"
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
 os.makedirs(LOG_DIR, exist_ok=True)
+
+# Configuration du niveau de log via variable d'environnement (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+LOG_LEVEL = getattr(logging, LOG_LEVEL, logging.INFO)
+
+# Format personnalisé pour tous les logs : [ollama-sim] + niveau + message
+log_format = "[ollama-sim] %(asctime)s [%(levelname)s] %(message)s"
+
+# Configuration de base pour tous les loggers
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=LOG_LEVEL,
+    format=log_format,
     handlers=[
         logging.FileHandler(f"{LOG_DIR}/ollama-sim.log"),
         logging.StreamHandler(),
     ],
 )
+
+# Désactiver les logs des bibliothèques tierces (ex: httpx, paho-mqtt) sauf si DEBUG est activé
+if LOG_LEVEL != logging.DEBUG:
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("paho").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn").setLevel(logging.WARNING)
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+
+# Logger principal pour le projet
 log = logging.getLogger("ollama-sim")
 
 def log_block(label: str, data: dict | str):
-    sep  = "─" * 64
+    sep = "─" * 64
     body = json.dumps(data, indent=2, ensure_ascii=False) if isinstance(data, dict) else data
     log.info(f"\n{sep}\n{label}\n{body}\n{sep}")
 
@@ -124,10 +142,12 @@ class RulesLoader:
         self.path    = Path(path)
         self._rules  = ""
         self._lock   = threading.Lock()
+        log.debug(f"[rules] Initialisation du chargeur de règles depuis {self.path}")
         self._load()
         self._start_watcher()
 
     def _load(self):
+        log.debug(f"[rules] Chargement du fichier {self.path}")
         if self.path.exists():
             with open(self.path, encoding="utf-8") as f:
                 content = f.read().strip()
@@ -154,6 +174,7 @@ class RulesLoader:
 
     def get(self) -> str:
         with self._lock:
+            log.debug(f"[rules] Récupération des règles ({len(self._rules)} caractères)")
             return self._rules
 
 rules_loader = RulesLoader(RULES_FILE)
@@ -168,14 +189,19 @@ _loop: asyncio.AbstractEventLoop | None = None
 def _on_mqtt_message(client, userdata, message):
     """Appelé dans le thread MQTT — résout la Future correspondante."""
     try:
+        log.debug(f"[mqtt] Message reçu sur {message.topic}: {message.payload.decode()[:200]}")
         payload = json.loads(message.payload.decode())
         corr_id = payload.get("correlation_id")
         if not corr_id:
+            log.warning(f"[mqtt] Message sans correlation_id ignoré: {payload}")
             return
         with _pending_lock:
             future = _pending.get(corr_id)
         if future and _loop:
+            log.debug(f"[mqtt] Résolution de la Future pour corr_id={corr_id[:8]}...")
             _loop.call_soon_threadsafe(future.set_result, payload)
+        else:
+            log.warning(f"[mqtt] Aucune Future trouvée pour corr_id={corr_id[:8]}...")
     except Exception as e:
         log.error(f"[mqtt] Erreur réception : {e}")
 
@@ -183,6 +209,7 @@ def _on_execution_message(client, userdata, message):
     """Le TS déclenche une exécution planifiée — à traiter séparément."""
     try:
         payload = json.loads(message.payload.decode())
+        log.debug(f"[mqtt] Message d'exécution reçu sur {message.topic}")
         log.info(f"[mqtt] Déclenchement exécution reçu : {json.dumps(payload)[:200]}")
         # TODO : soumettre à Mistral pour déploiement, puis exécuter via HA
     except Exception as e:
@@ -197,6 +224,7 @@ mqtt_client.message_callback_add(TOPIC_EXECUTION, _on_execution_message)
 
 def start_mqtt():
     try:
+        log.debug(f"[mqtt] Tentative de connexion à {MQTT_HOST}:{MQTT_PORT}")
         mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
         mqtt_client.subscribe([(TOPIC_REPONSE, 1), (TOPIC_EXECUTION, 1)])
         mqtt_client.loop_start()
@@ -213,6 +241,7 @@ async def mqtt_send_and_wait(payload: dict) -> dict:
     corr_id = str(uuid.uuid4())
     payload["correlation_id"] = corr_id
 
+    log.debug(f"[mqtt] Préparation de l'envoi MQTT avec corr_id={corr_id[:8]}...")
     future = asyncio.get_event_loop().create_future()
     with _pending_lock:
         _pending[corr_id] = future
@@ -230,6 +259,7 @@ async def mqtt_send_and_wait(payload: dict) -> dict:
     finally:
         with _pending_lock:
             _pending.pop(corr_id, None)
+        log.debug(f"[mqtt] Nettoyage de la Future pour corr_id={corr_id[:8]}...")
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 
@@ -239,11 +269,13 @@ app = FastAPI(title="ollama-sim", version="0.2.0")
 async def startup():
     global _loop
     _loop = asyncio.get_event_loop()
+    log.info("[startup] Démarrage de l'application ollama-sim")
     start_mqtt()
 
 @app.middleware("http")
 async def log_all_requests(request: Request, call_next):
     body = await request.body()
+    log.debug(f">>> {request.method} {request.url.path} — headers: {dict(request.headers)[:10]}")
     log.info(f">>> {request.method} {request.url.path} — body: {body.decode()[:200]}")
     response = await call_next(request)
     log.info(f"<<< {response.status_code}")
@@ -364,22 +396,29 @@ async def stream_mistral_to_ollama(
     text_parts:       list[str]  = []
     tool_calls:       list[dict] = []
     tool_call_buffer: dict[int, dict] = {}
+    
+    log.debug(f"[stream] Début du streaming depuis Mistral pour le modèle {ollama_model}")
 
     async for line in mistral_stream.aiter_lines():
+        log.debug(f"[stream] Ligne reçue: {line[:100]}")
         if not line or not line.startswith("data: "):
             continue
         payload = line[6:].strip()
         if payload == "[DONE]":
+            log.debug(f"[stream] Fin du stream (DONE)")
             break
         try:
             chunk = json.loads(payload)
         except json.JSONDecodeError:
+            log.warning(f"[stream] Impossible de décoder le chunk: {payload[:100]}")
             continue
 
         choice        = chunk.get("choices", [{}])[0]
         delta         = choice.get("delta", {})
         content       = delta.get("content") or ""
         finish_reason = choice.get("finish_reason")
+        
+        log.debug(f"[stream] Chunk décodé: content={content[:50]}, finish_reason={finish_reason}")
 
         for tc_delta in delta.get("tool_calls", []):
             idx  = tc_delta.get("index", 0)
@@ -399,8 +438,10 @@ async def stream_mistral_to_ollama(
         if usage:
             prompt_tokens     = usage.get("prompt_tokens",     prompt_tokens)
             completion_tokens = usage.get("completion_tokens", completion_tokens)
+            log.debug(f"[stream] Usage mis à jour: prompt_tokens={prompt_tokens}, completion_tokens={completion_tokens}")
 
         if finish_reason in ("stop", "tool_calls"):
+            log.debug(f"[stream] Fin de la génération (reason={finish_reason})")
             if content:
                 text_parts.append(content)
                 yield json.dumps({
@@ -413,6 +454,7 @@ async def stream_mistral_to_ollama(
 
         if content:
             text_parts.append(content)
+            log.debug(f"[stream] Émission d'un chunk Ollama: {content[:50]}")
             yield json.dumps({
                 "model":      ollama_model,
                 "created_at": now_iso(),
@@ -488,17 +530,28 @@ async def show_model(request: Request):
 async def chat(request: Request):
     """Route principale — injection règles, détection JSON structuré, routage MQTT."""
     body = await request.json()
+    log.debug(f"[chat] Requête reçue: {json.dumps(body, ensure_ascii=False)[:500]}")
     log_block("📨 HA → PROXY  [/api/chat]", body)
 
     if not MISTRAL_API_KEY:
+        log.error("[chat] MISTRAL_API_KEY non définie")
         raise HTTPException(503, "MISTRAL_API_KEY non définie")
 
     ollama_model  = body.get("model", "mistral")
     mistral_model = resolve_model(ollama_model)
+    log.debug(f"[chat] Modèle Ollama: {ollama_model} → Modèle Mistral: {mistral_model}")
+    
     messages      = build_messages(body)
+    log.debug(f"[chat] Messages construits: {len(messages)} messages")
+    
     messages      = inject_rules(messages)        # ← injection des règles
+    log.debug(f"[chat] Règles injectées dans les messages")
+    
     options       = body.get("options", {})
+    log.debug(f"[chat] Options: {options}")
+    
     question      = extract_question(messages)
+    log.debug(f"[chat] Question extraite: {question[:200]}")
 
     mistral_payload = {
         "model":    mistral_model,
