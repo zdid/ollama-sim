@@ -11,6 +11,7 @@ import logging
 import os
 import threading
 import uuid
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator
@@ -36,7 +37,11 @@ TOPIC_COMMANDE   = "domotique/mistral/commande"    # proxy → TS
 TOPIC_REPONSE    = "domotique/mistral/reponse"     # TS → proxy
 TOPIC_EXECUTION  = "domotique/mistral/execution"   # TS → proxy (déclenchement planifié)
 
-RULES_FILE       = os.environ.get("RULES_FILE", "/app/rules/regles_mistral.txt")
+DEFAULT_RULES_FILE = Path(__file__).resolve().parents[1] / "rules" / "regles_mistral.txt"
+RULES_FILE       = os.environ.get(
+    "RULES_FILE",
+    str(DEFAULT_RULES_FILE if DEFAULT_RULES_FILE.exists() else Path("/app/rules/regles_mistral.txt")),
+)
 LOG_DIR          = "/app/logs"
 MQTT_TIMEOUT_SEC = 2   # délai max d'attente réponse TS
 
@@ -159,6 +164,13 @@ class RulesLoader:
 
     def _start_watcher(self):
         loader = self
+        parent_dir = self.path.parent
+
+        if not parent_dir.exists():
+            log.warning(
+                f"[rules] Répertoire de surveillance introuvable : {parent_dir} — la détection de modification est désactivée"
+            )
+            return
 
         class Handler(FileSystemEventHandler):
             def on_modified(self, event):
@@ -167,10 +179,15 @@ class RulesLoader:
                     loader._load()
 
         observer = Observer()
-        observer.schedule(Handler(), str(self.path.parent), recursive=False)
+        observer.schedule(Handler(), str(parent_dir), recursive=False)
         observer.daemon = True
-        observer.start()
-        log.info(f"[rules] Surveillance active sur {self.path.parent}")
+        try:
+            observer.start()
+            log.info(f"[rules] Surveillance active sur {parent_dir}")
+        except OSError as exc:
+            log.warning(
+                f"[rules] Impossible de démarrer l'observateur de fichiers pour {parent_dir} : {exc}"
+            )
 
     def get(self) -> str:
         with self._lock:
@@ -215,11 +232,15 @@ def _on_execution_message(client, userdata, message):
     except Exception as e:
         log.error(f"[mqtt] Erreur exécution : {e}")
 
-mqtt_client = mqtt.Client(client_id="ollama-sim", protocol=mqtt.MQTTv5)
+mqtt_client = mqtt.Client(
+    callback_api_version=mqtt.CallbackAPIVersion.API_VERSION2,
+    client_id="ollama-sim",
+    protocol=mqtt.MQTTv5,
+)
 if MQTT_USER:
     mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 
-mqtt_client.message_callback_add(TOPIC_REPONSE,   _on_mqtt_message)
+mqtt_client.message_callback_add(TOPIC_REPONSE, _on_mqtt_message)
 mqtt_client.message_callback_add(TOPIC_EXECUTION, _on_execution_message)
 
 def start_mqtt():
@@ -265,12 +286,20 @@ async def mqtt_send_and_wait(payload: dict) -> dict:
 
 app = FastAPI(title="ollama-sim", version="0.2.0")
 
-@app.on_event("startup")
-async def startup():
+@asynccontextmanager
+def lifespan(app: FastAPI):
     global _loop
     _loop = asyncio.get_event_loop()
     log.info("[startup] Démarrage de l'application ollama-sim")
     start_mqtt()
+    try:
+        yield
+    finally:
+        mqtt_client.loop_stop()
+        mqtt_client.disconnect()
+        log.info("[shutdown] MQTT arrêté et application arrêtée")
+
+app.router.lifespan_context = lifespan
 
 @app.middleware("http")
 async def log_all_requests(request: Request, call_next):
