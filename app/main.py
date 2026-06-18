@@ -10,8 +10,8 @@ import json
 import logging
 import os
 import threading
+import time
 import uuid
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import AsyncIterator
@@ -20,8 +20,6 @@ import httpx
 import paho.mqtt.client as mqtt
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
-from watchdog.events import FileSystemEventHandler
-from watchdog.observers import Observer
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -36,19 +34,15 @@ MQTT_PASS        = os.environ.get("MQTT_PASS",    "")
 TOPIC_COMMANDE   = "domotique/mistral/commande"    # proxy → TS
 TOPIC_REPONSE    = "domotique/mistral/reponse"     # TS → proxy
 TOPIC_EXECUTION  = "domotique/mistral/execution"   # TS → proxy (déclenchement planifié)
+TOPIC_TS_STATUS   = "domotique/mistral/status/ts-planner"  # LWT pour ts-planner
+TOPIC_RULES      = "domotique/mistral/rules"       # Règles avec retain
 
-DEFAULT_RULES_FILE = Path(__file__).resolve().parents[1] / "rules" / "regles_mistral.txt"
-RULES_FILE       = os.environ.get(
-    "RULES_FILE",
-    str(DEFAULT_RULES_FILE if DEFAULT_RULES_FILE.exists() else Path("/app/rules/regles_mistral.txt")),
-)
+RULES_FILE       = os.environ.get("RULES_FILE", "/app/rules/regles_mistral.txt")
 LOG_DIR          = "/app/logs"
-MQTT_TIMEOUT_SEC = 2   # délai max d'attente réponse TS
+MQTT_TIMEOUT_SEC = 2   # délai max d'attente réponse TS (réduit à 2s)
 
-# ─── Types JSON structurés à router vers MQTT ─────────────────────────────────
-
-STRUCTURED_TYPES = {"planification", "macro", "macro_ref", "condition",
-                    "sequence", "gestion", "execution"}
+# État de ts-planner (mis à jour via LWT)
+TS_PLANNER_ONLINE = False
 
 # ─── Modèles Mistral ──────────────────────────────────────────────────────────
 
@@ -80,36 +74,18 @@ DEFAULT_MODEL = "mistral-small-latest"
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
 os.makedirs(LOG_DIR, exist_ok=True)
-
-# Configuration du niveau de log via variable d'environnement (DEBUG, INFO, WARNING, ERROR, CRITICAL)
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-LOG_LEVEL = getattr(logging, LOG_LEVEL, logging.INFO)
-
-# Format personnalisé pour tous les logs : [ollama-sim] + niveau + message
-log_format = "[ollama-sim] %(asctime)s [%(levelname)s] %(message)s"
-
-# Configuration de base pour tous les loggers
 logging.basicConfig(
-    level=LOG_LEVEL,
-    format=log_format,
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] [ollama-sim] %(message)s",
     handlers=[
         logging.FileHandler(f"{LOG_DIR}/ollama-sim.log"),
         logging.StreamHandler(),
     ],
 )
-
-# Désactiver les logs des bibliothèques tierces (ex: httpx, paho-mqtt) sauf si DEBUG est activé
-if LOG_LEVEL != logging.DEBUG:
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("paho").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-
-# Logger principal pour le projet
 log = logging.getLogger("ollama-sim")
 
 def log_block(label: str, data: dict | str):
-    sep = "─" * 64
+    sep  = "─" * 64
     body = json.dumps(data, indent=2, ensure_ascii=False) if isinstance(data, dict) else data
     log.info(f"\n{sep}\n{label}\n{body}\n{sep}")
 
@@ -138,61 +114,44 @@ def log_conversation(ollama_model: str, mistral_model: str,
     with open(_model_log_path(mistral_model), "a", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
-# ─── Règles domotiques (watchdog) ─────────────────────────────────────────────
+# ─── Règles domotiques (MQTT + retain) ────────────────────────────────────────
+
+_rules_lock = threading.Lock()
 
 class RulesLoader:
-    """Charge et surveille le fichier de règles. Rechargement automatique à la sauvegarde."""
+    """Charge les règles depuis MQTT (avec retain) ou le fichier local."""
 
     def __init__(self, path: str):
-        self.path    = Path(path)
-        self._rules  = ""
-        self._lock   = threading.Lock()
-        log.debug(f"[rules] Initialisation du chargeur de règles depuis {self.path}")
-        self._load()
-        self._start_watcher()
+        self.path = Path(path)
+        self._rules = ""
+        self._lock = threading.Lock()
+        self._load_initial()  # Charger initialement depuis MQTT ou fichier
 
-    def _load(self):
-        log.debug(f"[rules] Chargement du fichier {self.path}")
-        if self.path.exists():
-            with open(self.path, encoding="utf-8") as f:
-                content = f.read().strip()
-            with self._lock:
+    def _load_initial(self):
+        """Charge les règles depuis MQTT (si disponible) ou le fichier local."""
+        # Attendre que MQTT soit connecté et que les règles soient reçues via retain
+        # (Le broker envoie automatiquement le dernier message retain après abonnement)
+        # Si aucune règle n'est reçue après 2 secondes, charger depuis le fichier local
+        time.sleep(2)  # Attendre que le message retain soit reçu
+
+        with self._lock:
+            if not self._rules and self.path.exists():
+                with open(self.path, encoding="utf-8") as f:
+                    content = f.read().strip()
                 self._rules = content
-            log.info(f"[rules] Règles chargées depuis {self.path} ({len(content)} caractères)")
-        else:
-            log.warning(f"[rules] Fichier non trouvé : {self.path} — règles vides")
-
-    def _start_watcher(self):
-        loader = self
-        parent_dir = self.path.parent
-
-        if not parent_dir.exists():
-            log.warning(
-                f"[rules] Répertoire de surveillance introuvable : {parent_dir} — la détection de modification est désactivée"
-            )
-            return
-
-        class Handler(FileSystemEventHandler):
-            def on_modified(self, event):
-                if Path(event.src_path).resolve() == loader.path.resolve():
-                    log.info(f"[rules] Modification détectée → rechargement")
-                    loader._load()
-
-        observer = Observer()
-        observer.schedule(Handler(), str(parent_dir), recursive=False)
-        observer.daemon = True
-        try:
-            observer.start()
-            log.info(f"[rules] Surveillance active sur {parent_dir}")
-        except OSError as exc:
-            log.warning(
-                f"[rules] Impossible de démarrer l'observateur de fichiers pour {parent_dir} : {exc}"
-            )
+                log.info(f"[rules] Règles chargées depuis {self.path} ({len(content)} caractères)")
+            elif not self._rules:
+                log.warning("[rules] Aucune règle disponible (MQTT et fichier local introuvables)")
 
     def get(self) -> str:
         with self._lock:
-            log.debug(f"[rules] Récupération des règles ({len(self._rules)} caractères)")
             return self._rules
+
+    def update_from_mqtt(self, rules: str):
+        """Met à jour les règles depuis MQTT."""
+        with self._lock:
+            self._rules = rules
+        log.info(f"[rules] Règles mises à jour via MQTT ({len(rules)} caractères)")
 
 rules_loader = RulesLoader(RULES_FILE)
 
@@ -206,19 +165,14 @@ _loop: asyncio.AbstractEventLoop | None = None
 def _on_mqtt_message(client, userdata, message):
     """Appelé dans le thread MQTT — résout la Future correspondante."""
     try:
-        log.debug(f"[mqtt] Message reçu sur {message.topic}: {message.payload.decode()[:200]}")
         payload = json.loads(message.payload.decode())
         corr_id = payload.get("correlation_id")
         if not corr_id:
-            log.warning(f"[mqtt] Message sans correlation_id ignoré: {payload}")
             return
         with _pending_lock:
             future = _pending.get(corr_id)
         if future and _loop:
-            log.debug(f"[mqtt] Résolution de la Future pour corr_id={corr_id[:8]}...")
             _loop.call_soon_threadsafe(future.set_result, payload)
-        else:
-            log.warning(f"[mqtt] Aucune Future trouvée pour corr_id={corr_id[:8]}...")
     except Exception as e:
         log.error(f"[mqtt] Erreur réception : {e}")
 
@@ -226,49 +180,84 @@ def _on_execution_message(client, userdata, message):
     """Le TS déclenche une exécution planifiée — à traiter séparément."""
     try:
         payload = json.loads(message.payload.decode())
-        log.debug(f"[mqtt] Message d'exécution reçu sur {message.topic}")
         log.info(f"[mqtt] Déclenchement exécution reçu : {json.dumps(payload)[:200]}")
         # TODO : soumettre à Mistral pour déploiement, puis exécuter via HA
     except Exception as e:
         log.error(f"[mqtt] Erreur exécution : {e}")
 
-mqtt_client = mqtt.Client(
-    callback_api_version=mqtt.CallbackAPIVersion.API_VERSION2,
-    client_id="ollama-sim",
-    protocol=mqtt.MQTTv5,
-)
+def _on_ts_planner_status(client, userdata, message):
+    """Met à jour l'état de ts-planner via LWT."""
+    global TS_PLANNER_ONLINE
+    try:
+        payload = message.payload.decode()
+        if payload == "online":
+            TS_PLANNER_ONLINE = True
+            log.info("[status] ts-planner est ONLINE")
+        elif payload == "offline":
+            TS_PLANNER_ONLINE = False
+            log.warning("[status] ts-planner est OFFLINE (LWT reçu)")
+    except Exception as e:
+        log.error(f"[status] Erreur: {e}")
+
+def _on_rules_update(client, userdata, message):
+    """Met à jour les règles depuis le topic MQTT (avec retain)."""
+    try:
+        payload = message.payload.decode()
+        rules_loader.update_from_mqtt(payload)
+    except Exception as e:
+        log.error(f"[rules] Erreur: {e}")
+
+# Client MQTT (v3.1)
+mqtt_client = mqtt.Client(client_id="ollama-sim", protocol=mqtt.MQTTv31)
 if MQTT_USER:
     mqtt_client.username_pw_set(MQTT_USER, MQTT_PASS)
 
-mqtt_client.message_callback_add(TOPIC_REPONSE, _on_mqtt_message)
+# Configurer le LWT pour ollama-sim (optionnel)
+mqtt_client.will_set(TOPIC_TS_STATUS, "ollama-sim-offline", qos=1, retain=True)
+
+# Abonnements MQTT
+mqtt_client.message_callback_add(TOPIC_REPONSE,   _on_mqtt_message)
 mqtt_client.message_callback_add(TOPIC_EXECUTION, _on_execution_message)
+mqtt_client.message_callback_add(TOPIC_TS_STATUS, _on_ts_planner_status)
+mqtt_client.message_callback_add(TOPIC_RULES,     _on_rules_update)
 
 def start_mqtt():
     try:
-        log.debug(f"[mqtt] Tentative de connexion à {MQTT_HOST}:{MQTT_PORT}")
         mqtt_client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
-        mqtt_client.subscribe([(TOPIC_REPONSE, 1), (TOPIC_EXECUTION, 1)])
+        mqtt_client.subscribe([
+            (TOPIC_REPONSE, 1),
+            (TOPIC_EXECUTION, 1),
+            (TOPIC_TS_STATUS, 1),
+            (TOPIC_RULES, 1)  # S'abonner aux règles avec retain
+        ])
         mqtt_client.loop_start()
-        log.info(f"[mqtt] Connecté à {MQTT_HOST}:{MQTT_PORT}")
+        log.info(f"[mqtt] Connecté à {MQTT_HOST}:{MQTT_PORT} (MQTT v3.1)")
     except Exception as e:
-        log.error(f"[mqtt] Connexion impossible : {e}")
+        log.error(f"[mqtt] Connexion impossible: {e}")
 
 async def mqtt_send_and_wait(payload: dict) -> dict:
     """
     Publie sur TOPIC_COMMANDE et attend la réponse sur TOPIC_REPONSE.
     Utilise un correlation_id pour matcher la bonne réponse.
-    Timeout : MQTT_TIMEOUT_SEC secondes.
+    Timeout : MQTT_TIMEOUT_SEC secondes (2s).
     """
+    if not TS_PLANNER_ONLINE:
+        log.warning("[mqtt] ts-planner est OFFLINE, passage en mode dégradé")
+        return {"error": "offline", "message": "ts-planner est hors ligne"}
+
     corr_id = str(uuid.uuid4())
     payload["correlation_id"] = corr_id
 
-    log.debug(f"[mqtt] Préparation de l'envoi MQTT avec corr_id={corr_id[:8]}...")
     future = asyncio.get_event_loop().create_future()
     with _pending_lock:
         _pending[corr_id] = future
 
-    mqtt_client.publish(TOPIC_COMMANDE, json.dumps(payload, ensure_ascii=False), qos=1)
-    log.info(f"[mqtt] Publié sur {TOPIC_COMMANDE} (corr={corr_id[:8]}...)")
+    try:
+        mqtt_client.publish(TOPIC_COMMANDE, json.dumps(payload, ensure_ascii=False), qos=1)
+        log.info(f"[mqtt] Publié sur {TOPIC_COMMANDE} (corr={corr_id[:8]}...)")
+    except Exception as e:
+        log.error(f"[mqtt] Échec publication MQTT: {e}. Mode dégradé activé.")
+        return {"error": "mqtt_error", "message": f"Erreur MQTT: {e}"}
 
     try:
         result = await asyncio.wait_for(future, timeout=MQTT_TIMEOUT_SEC)
@@ -280,31 +269,20 @@ async def mqtt_send_and_wait(payload: dict) -> dict:
     finally:
         with _pending_lock:
             _pending.pop(corr_id, None)
-        log.debug(f"[mqtt] Nettoyage de la Future pour corr_id={corr_id[:8]}...")
 
 # ─── App ──────────────────────────────────────────────────────────────────────
 
 app = FastAPI(title="ollama-sim", version="0.2.0")
 
-@asynccontextmanager
-def lifespan(app: FastAPI):
+@app.on_event("startup")
+async def startup():
     global _loop
     _loop = asyncio.get_event_loop()
-    log.info("[startup] Démarrage de l'application ollama-sim")
     start_mqtt()
-    try:
-        yield
-    finally:
-        mqtt_client.loop_stop()
-        mqtt_client.disconnect()
-        log.info("[shutdown] MQTT arrêté et application arrêtée")
-
-app.router.lifespan_context = lifespan
 
 @app.middleware("http")
 async def log_all_requests(request: Request, call_next):
     body = await request.body()
-    log.debug(f">>> {request.method} {request.url.path} — headers: {dict(request.headers)[:10]}")
     log.info(f">>> {request.method} {request.url.path} — body: {body.decode()[:200]}")
     response = await call_next(request)
     log.info(f"<<< {response.status_code}")
@@ -416,6 +394,9 @@ def make_confirmation_chunk(model: str, text: str) -> str:
 
 # ─── Streaming Mistral → Ollama NDJSON ────────────────────────────────────────
 
+STRUCTURED_TYPES = {"planification", "macro", "macro_ref", "condition",
+                    "sequence", "gestion", "execution"}
+
 async def stream_mistral_to_ollama(
     mistral_stream: httpx.Response,
     ollama_model:   str,
@@ -425,29 +406,22 @@ async def stream_mistral_to_ollama(
     text_parts:       list[str]  = []
     tool_calls:       list[dict] = []
     tool_call_buffer: dict[int, dict] = {}
-    
-    log.debug(f"[stream] Début du streaming depuis Mistral pour le modèle {ollama_model}")
 
     async for line in mistral_stream.aiter_lines():
-        log.debug(f"[stream] Ligne reçue: {line[:100]}")
         if not line or not line.startswith("data: "):
             continue
         payload = line[6:].strip()
         if payload == "[DONE]":
-            log.debug(f"[stream] Fin du stream (DONE)")
             break
         try:
             chunk = json.loads(payload)
         except json.JSONDecodeError:
-            log.warning(f"[stream] Impossible de décoder le chunk: {payload[:100]}")
             continue
 
         choice        = chunk.get("choices", [{}])[0]
         delta         = choice.get("delta", {})
         content       = delta.get("content") or ""
         finish_reason = choice.get("finish_reason")
-        
-        log.debug(f"[stream] Chunk décodé: content={content[:50]}, finish_reason={finish_reason}")
 
         for tc_delta in delta.get("tool_calls", []):
             idx  = tc_delta.get("index", 0)
@@ -467,10 +441,8 @@ async def stream_mistral_to_ollama(
         if usage:
             prompt_tokens     = usage.get("prompt_tokens",     prompt_tokens)
             completion_tokens = usage.get("completion_tokens", completion_tokens)
-            log.debug(f"[stream] Usage mis à jour: prompt_tokens={prompt_tokens}, completion_tokens={completion_tokens}")
 
         if finish_reason in ("stop", "tool_calls"):
-            log.debug(f"[stream] Fin de la génération (reason={finish_reason})")
             if content:
                 text_parts.append(content)
                 yield json.dumps({
@@ -483,7 +455,6 @@ async def stream_mistral_to_ollama(
 
         if content:
             text_parts.append(content)
-            log.debug(f"[stream] Émission d'un chunk Ollama: {content[:50]}")
             yield json.dumps({
                 "model":      ollama_model,
                 "created_at": now_iso(),
@@ -512,7 +483,6 @@ async def stream_mistral_to_ollama(
 async def version():
     return JSONResponse({"version": "0.5.1"})
 
-
 @app.get("/api/tags")
 async def list_models():
     models = []
@@ -539,7 +509,6 @@ async def list_models():
     log.info(f"[/api/tags] {len(models)} modèles exposés")
     return JSONResponse({"models": models})
 
-
 @app.post("/api/show")
 async def show_model(request: Request):
     body  = await request.json()
@@ -554,33 +523,21 @@ async def show_model(request: Request):
         },
     })
 
-
 @app.post("/api/chat")
 async def chat(request: Request):
     """Route principale — injection règles, détection JSON structuré, routage MQTT."""
     body = await request.json()
-    log.debug(f"[chat] Requête reçue: {json.dumps(body, ensure_ascii=False)[:500]}")
     log_block("📨 HA → PROXY  [/api/chat]", body)
 
     if not MISTRAL_API_KEY:
-        log.error("[chat] MISTRAL_API_KEY non définie")
         raise HTTPException(503, "MISTRAL_API_KEY non définie")
 
     ollama_model  = body.get("model", "mistral")
     mistral_model = resolve_model(ollama_model)
-    log.debug(f"[chat] Modèle Ollama: {ollama_model} → Modèle Mistral: {mistral_model}")
-    
     messages      = build_messages(body)
-    log.debug(f"[chat] Messages construits: {len(messages)} messages")
-    
     messages      = inject_rules(messages)        # ← injection des règles
-    log.debug(f"[chat] Règles injectées dans les messages")
-    
     options       = body.get("options", {})
-    log.debug(f"[chat] Options: {options}")
-    
     question      = extract_question(messages)
-    log.debug(f"[chat] Question extraite: {question[:200]}")
 
     mistral_payload = {
         "model":    mistral_model,
@@ -631,75 +588,3 @@ async def chat(request: Request):
 
                 # ── Détection JSON structuré ───────────────────────────────
                 full_text    = "".join(text_parts)
-                structured   = extract_json_from_text(full_text)
-
-                if structured:
-                    # ── Routage MQTT → programme TS ───────────────────────
-                    log_block("📡 MQTT → TS", structured)
-                    mqtt_response = await mqtt_send_and_wait(structured)
-
-                    confirmation = mqtt_response.get(
-                        "message",
-                        "Commande transmise au gestionnaire de planification."
-                    )
-                    if mqtt_response.get("error"):
-                        confirmation = f"Erreur : {mqtt_response.get('message', 'inconnue')}"
-
-                    log.info(f"[mqtt] Confirmation : {confirmation}")
-                    yield make_confirmation_chunk(ollama_model, confirmation)
-                    done = make_ollama_done_chunk(ollama_model)
-                    yield json.dumps(done, ensure_ascii=False) + "\n"
-
-                else:
-                    # ── Réponse texte normale → transmettre à HA ──────────
-                    for chunk in chunks_to_send:
-                        yield chunk
-
-        except httpx.ConnectError as e:
-            log.error(f"Connexion Mistral impossible: {e}")
-            yield json.dumps({"error": "Cannot reach Mistral API", "done": True}) + "\n"
-
-        finally:
-            if question:
-                log_conversation(ollama_model, mistral_model, question,
-                                 "".join(text_parts), tool_calls)
-            await client.aclose()
-
-    return StreamingResponse(
-        generate(),
-        media_type="application/x-ndjson",
-        headers={"X-Accel-Buffering": "no"},
-    )
-
-
-@app.post("/api/generate")
-async def generate_compat(request: Request):
-    body = await request.json()
-    body.setdefault("messages", [])
-    request._body = json.dumps(body).encode()
-    return await chat(request)
-
-
-@app.post("/api/embeddings")
-async def embeddings(request: Request):
-    body  = await request.json()
-    model = body.get("model", "mistral")
-    return JSONResponse({"model": model, "embedding": [0.0] * 4096})
-
-
-@app.get("/api/ps")
-async def ps():
-    return JSONResponse({"models": []})
-
-
-@app.delete("/api/delete")
-async def delete_model():
-    return JSONResponse({"status": "ok"})
-
-
-@app.post("/api/pull")
-async def pull_model(request: Request):
-    body  = await request.json()
-    model = body.get("model", "mistral")
-    log.info(f"[/api/pull] Simulation du pull pour : {model}")
-    return JSONResponse({"status": "success"})
